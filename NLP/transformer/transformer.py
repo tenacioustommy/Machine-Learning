@@ -63,19 +63,20 @@ class FeedForward(nn.Module):
         return self.linear2(self.dropout(F.relu(self.linear1(x))))
     
 class MultiHeadAttention(nn.Module):
-    def __init__(self, heads:int, d_model:int, dropout:float=0.1):
+    def __init__(self, heads:int, d_model:int, dropout:float=0.1,mask=None):
         super().__init__()
         self.d_model = d_model
         assert d_model % heads == 0,"d_model必须是heads的整数倍"
         self.d_k = d_model / heads
         self.h = heads
+        self.mask = mask
         self.W_Q = nn.Linear(d_model, d_model)
         self.W_V = nn.Linear(d_model, d_model)
         self.W_K = nn.Linear(d_model, d_model)
         self.W_out = nn.Linear(d_model, d_model)
         self.dropout = nn.Dropout(dropout)
         
-    def forward(self, q, k, v, mask=None):
+    def forward(self, q, k, v):
         batch_size = q.size(0)
         max_len = q.size(1)
         # perform linear operation and split into h heads
@@ -87,7 +88,7 @@ class MultiHeadAttention(nn.Module):
         q = q.transpose(1,2)
         v = v.transpose(1,2)
         # calculate attention using function we will define next
-        output,scores = self.attention(q, k, v, self.d_k, mask, self.dropout)
+        output,scores = self.attention(q, k, v, self.d_k, self.mask, self.dropout)
         # concatenate heads and put through final linear layer
         concat = scores.transpose(1,2).contiguous().view(batch_size, -1, self.d_model)
         output = self.W_out(concat)
@@ -136,3 +137,69 @@ class Encoder(nn.Module):
         for layer in self.layers:
             x = layer(x, mask)
         return self.norm(x)
+    
+class DecoderBlock(nn.Module):
+    def __init__(self, d_model:int, heads:int, d_ff:int, dropout:float=0.1):
+        super().__init__()
+        self.masked_multi_head_attention = MultiHeadAttention(heads, d_model, dropout, mask=True)
+        self.multi_head_attention = MultiHeadAttention(heads, d_model, dropout, mask=False)
+        self.feed_forward = FeedForward(d_model, d_ff, dropout)
+        self.residual = nn.ModuleList([ResidualConnection(dropout) for _ in range(3)])
+        
+    def forward(self, x, encoder_output, src_mask, tgt_mask):
+        x = self.residual[0](x, lambda x: self.masked_multi_head_attention(x, x, x, tgt_mask))
+        x = self.residual[1](x, lambda x: self.multi_head_attention(x, encoder_output, encoder_output, src_mask))
+        x = self.residual[2](x, lambda x: self.feed_forward(x))
+        return x
+    
+class Decoder(nn.Module):
+    def __init__(self, layers: nn.ModuleList):
+        super().__init__()
+        self.layers = layers
+        self.norm=LayerNormalization() 
+    def forward(self, x, encoder_output, src_mask, tgt_mask):
+        for layer in self.layers:
+            x = layer(x, encoder_output, src_mask, tgt_mask)
+        return self.norm(x)
+    
+class ProjectionLayer(nn.Module):
+    def __init__(self, d_model:int, vocab_size:int):
+        super().__init__()
+        self.linear = nn.Linear(d_model, vocab_size)
+        
+    def forward(self, x):
+        return F.log_softmax(self.linear(x), dim=-1)
+    
+class Transformer(nn.Module):
+    def __init__(self, src_vocab_size:int, tgt_vocab_size:int, d_model:int, d_ff:int, heads:int, max_len:int, n_layers:int, dropout:float=0.1):
+        super().__init__()
+        self.encoder = Encoder(nn.ModuleList([EncoderBlock(d_model, heads, d_ff, dropout) for _ in range(n_layers)]))
+        self.decoder = Decoder(nn.ModuleList([DecoderBlock(d_model, heads, d_ff, dropout) for _ in range(n_layers)]))
+        self.src_embedding = InputEmbedding(d_model, src_vocab_size)
+        self.tgt_embedding = InputEmbedding(d_model, tgt_vocab_size)
+        self.positional_encoding = PositionalEncoding(d_model, max_len, dropout)
+        self.projection = ProjectionLayer(d_model, tgt_vocab_size)
+        
+    def forward(self, src, tgt):
+        src_mask = (src != 0).unsqueeze(1).unsqueeze(2)
+        tgt_mask = (tgt != 0).unsqueeze(1).unsqueeze(2)
+        src = self.positional_encoding(self.src_embedding(src))
+        tgt = self.positional_encoding(self.tgt_embedding(tgt))
+        encoder_output = self.encoder(src, src_mask)
+        decoder_output = self.decoder(tgt, encoder_output, src_mask, tgt_mask)
+        return self.projection(decoder_output)
+    
+    def greedy_decode(self, src, max_len:int):
+        src_mask = (src != 0).unsqueeze(1).unsqueeze(2)
+        src = self.positional_encoding(self.src_embedding(src))
+        encoder_output = self.encoder(src, src_mask)
+        tgt = torch.ones(src.size(0), 1).fill_(1).type_as(src).long()
+        for i in range(max_len-1):
+            tgt_mask = (tgt != 0).unsqueeze(1).unsqueeze(2)
+            tgt = self.positional_encoding(self.tgt_embedding(tgt))
+            decoder_output = self.decoder(tgt, encoder_output, src_mask, tgt_mask)
+            decoder_output = self.projection(decoder_output)
+            decoder_output = decoder_output[:,-1].max(1)[1].unsqueeze(1)
+            tgt = torch.cat([tgt, decoder_output], dim=-1)
+        return tgt
+
