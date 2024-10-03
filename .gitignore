@@ -1,1 +1,4 @@
 /Emoji/data/
+/MLLAB
+*.jpg
+__pycache__
